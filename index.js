@@ -1,57 +1,58 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-// IMPORTANT: Ensure you import these from your firebase-admin config file
-import { db, serverTimestamp, FieldValue } from './firebase-admin.js'; 
+import admin from 'firebase-admin';
+
+// Load Environment Variables
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+// 1. FIREBASE ADMIN INITIALIZATION
+const isProduction = process.env.RENDER === 'true';
+const serviceAccountPath = isProduction 
+  ? '/etc/secrets/firebase-service-account.json' // Path for Render Secret File
+  : './your-local-key.json';                  // Path for your local machine
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccountPath)
+  });
+  console.log('✅ Firebase Admin initialized successfully');
+}
+
+// Export database and helpers for use in other route files
+export const db = admin.firestore();
+export const FieldValue = admin.firestore.FieldValue;
+export const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
+
+// 2. MIDDLEWARE CONFIGURATION
+app.use(cors({
+  origin: ["https://toll-project-479605.web.app", "http://localhost:5173"],
+  credentials: true
+}));
+app.use(express.json({ limit: '50mb' }));
+
+// 3. ROUTES
+// Replace these with your actual route file imports
 import authRoutes from './routes/authRoutes.js';
 import anprRoutes from './routes/anprRoutes.js';
 import zoneRoutes from './routes/zoneRoutes.js';
 
-dotenv.config();
-
-const app = express();
-const PORT = process.env.PORT || 5000;
-
-const allowedOriginsEnv = process.env.CORS_ALLOWED_ORIGINS;
-let corsMiddleware;
-
-if (!allowedOriginsEnv || allowedOriginsEnv === '*') {
-    corsMiddleware = cors(); 
-} else {
-    const allowedOrigins = allowedOriginsEnv
-        .split(',')
-        .map(origin => origin.trim())
-        .filter(Boolean);
-
-    corsMiddleware = cors({
-        origin: (origin, callback) => {
-            if (!origin || allowedOrigins.includes(origin)) {
-                return callback(null, true);
-            }
-            return callback(new Error(`Origin ${origin} not allowed by CORS`));
-        }
-    });
-}
-
-// Middleware
-app.use(corsMiddleware);
-app.use(express.json({ limit: '50mb' })); 
-
-// Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/anpr', anprRoutes);
 app.use('/api/zones', zoneRoutes);
 
 app.get('/', (req, res) => {
-    res.send('ANPR Toll System API is running.');
+    res.send('🚀 ANPR Toll System API is live and running.');
 });
 
-// --- BACKGROUND PROCESSOR LOGIC ---
-
+// 4. BACKGROUND PROCESSOR (Situations A, B, & C)
 const processExitedVehicles = async () => {
-    console.log("Checking for vehicles that exited the zone...");
+    console.log("⏱️  Checking for vehicles that exited the zone...");
     try {
-        // 10 minutes of silence = Vehicle has exited the zone
+        // Threshold: 10 minutes of inactivity = Exit
         const EXIT_THRESHOLD = new Date(Date.now() - 10 * 60 * 1000);
 
         const expiredTrips = await db.collection("vehicle_trips")
@@ -59,72 +60,74 @@ const processExitedVehicles = async () => {
             .where("lastSightingTimestamp", "<", EXIT_THRESHOLD)
             .get();
 
-        if (expiredTrips.empty) return;
+        if (expiredTrips.empty) {
+            console.log("No expired trips found.");
+            return;
+        }
 
         for (const doc of expiredTrips.docs) {
-    const trip = doc.data();
-    
-    // 1. HANDLE SITUATION C: Unregistered Vehicle
-    if (!trip.ownerId) {
-        await doc.ref.update({ status: "Invoice Pending" });
-        console.log(`Unregistered vehicle ${trip.plate} finalized.`);
-        continue;
-    }
+            const trip = doc.data();
+            
+            // SITUATION C: Unregistered Vehicle (No ownerId)
+            if (!trip.ownerId) {
+                await doc.ref.update({ status: "Invoice Pending" });
+                console.log(`📋 Unregistered: ${trip.plate} marked as Invoice Pending.`);
+                continue;
+            }
 
-    // 2. HANDLE REGISTERED VEHICLES (A & B)
-    const userDoc = await db.collection("users").doc(trip.ownerId).get();
-    const userData = userDoc.data();
+            // REGISTERED VEHICLES (A & B)
+            const userDoc = await db.collection("users").doc(trip.ownerId).get();
+            const userData = userDoc.data();
 
-    // FINAL CHECK: Situation A - Did GPS reconnect or stay in 'Searching'?
-    const isGpsActive = userData?.gpsStatus === 'Connected' || userData?.gpsStatus === 'Searching';
+            // SITUATION A: GPS is active/searching (Bypass)
+            const isGpsActive = userData?.gpsStatus === 'Connected' || userData?.gpsStatus === 'Searching';
+            if (isGpsActive) {
+                await doc.ref.update({ 
+                    status: `Bypassed (GPS ${userData.gpsStatus})`, 
+                    totalToll: 0 
+                });
+                console.log(`✅ Bypassed: ${trip.plate} (GPS was ${userData.gpsStatus}).`);
+                continue;
+            }
 
-    if (userDoc.exists && isGpsActive) {
-        await doc.ref.update({ 
-            status: `Bypassed (GPS ${userData.gpsStatus})`, 
-            totalToll: 0 
-        });
-        console.log(`Trip ${doc.id} bypassed: GPS ${userData.gpsStatus} at exit.`);
-        continue;
-    }
+            // SITUATION B: GPS Offline (Deduct Wallet)
+            try {
+                const batch = db.batch();
+                
+                // Deduct balance
+                batch.update(db.collection("users").doc(trip.ownerId), {
+                    walletBalance: FieldValue.increment(-trip.totalToll)
+                });
 
-    // Situation B: GPS stayed offline. Charge once.
-    try {
-        const batch = db.batch();
-        
-        // Deduct from wallet
-        batch.update(db.collection("users").doc(trip.ownerId), {
-            walletBalance: FieldValue.increment(-trip.totalToll)
-        });
+                // Record Transaction
+                const transRef = db.collection("transactions").doc();
+                batch.set(transRef, {
+                    amount: trip.totalToll,
+                    description: `Toll: ${trip.tollZoneName} (ANPR Backup)`,
+                    timestamp: serverTimestamp(),
+                    type: "debit",
+                    userId: trip.ownerId,
+                    plate: trip.plate
+                });
 
-        // Create transaction history
-        const transactionRef = db.collection("transactions").doc();
-        batch.set(transactionRef, {
-            amount: trip.totalToll,
-            description: `Toll Finalized - ${trip.tollZoneName} (ANPR Backup)`,
-            timestamp: serverTimestamp(),
-            type: "debit",
-            userId: trip.ownerId,
-            plate: trip.plate
-        });
-
-        // Mark trip as finished
-        batch.update(doc.ref, { status: "completed" });
-        
-        await batch.commit();
-        console.log(`Trip ${doc.id} finalized: Wallet deducted for ${trip.plate}.`);
+                // Complete Trip
+                batch.update(doc.ref, { status: "completed" });
+                
+                await batch.commit();
+                console.log(`💰 Finalized: Wallet deducted for ${trip.plate}.`);
+            } catch (payError) {
+                console.error(`Payment failed for ${trip.plate}:`, payError);
+            }
+        }
     } catch (error) {
-        console.error(`Failed to process payment for ${trip.plate}:`, error);
-    }
-}
-    } catch (error) {
-        console.error("Processor Error:", error.message);
+        console.error("❌ Processor Error:", error.message);
     }
 };
 
-// Run exit check every 60 seconds
+// Start the 60-second background timer
 setInterval(processExitedVehicles, 60000);
 
-// Start the server
-app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
-}); 
+// 5. SERVER START
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`📡 Server listening on port ${PORT}`);
+});
