@@ -14,7 +14,6 @@ const isProduction = process.env.RENDER === 'true';
 
 /**
  * Render mounts Secret Files at /etc/secrets/<filename>
- * Make sure the filename matches exactly what you typed in Render
  */
 const serviceAccountPath = isProduction 
   ? '/etc/secrets/firebase-service-account.json' 
@@ -23,7 +22,10 @@ const serviceAccountPath = isProduction
 if (!admin.apps.length) {
   try {
     admin.initializeApp({
-      credential: admin.credential.cert(serviceAccountPath)
+      credential: admin.credential.cert(serviceAccountPath),
+      // Explicitly setting the project ID helps resolve auth issues
+      projectId: "toll-project-479605", 
+      databaseURL: "https://toll-project-479605.firebaseio.com"
     });
     console.log('✅ Firebase Admin initialized successfully');
   } catch (error) {
@@ -32,10 +34,9 @@ if (!admin.apps.length) {
 }
 
 export const db = admin.firestore();
-// Use the modern firestore namespace for FieldValue in newer SDKs
 export const FieldValue = admin.firestore.FieldValue;
 
-// 2. MIDDLEWARE
+// 2. MIDDLEWARE CONFIGURATION
 app.use(cors({
   origin: '*', 
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
@@ -70,8 +71,42 @@ const processExitedVehicles = async () => {
         if (expiredTrips.empty) return;
 
         for (const doc of expiredTrips.docs) {
-            // ... your existing processing logic ...
-            console.log(`Processing trip: ${doc.id}`);
+            const trip = doc.data();
+            
+            if (!trip.ownerId) {
+                await doc.ref.update({ status: "Invoice Pending" });
+                continue;
+            }
+
+            const userDoc = await db.collection("users").doc(trip.ownerId).get();
+            const userData = userDoc.data();
+
+            const isGpsActive = userData?.gpsStatus === 'Connected' || userData?.gpsStatus === 'Searching';
+            if (isGpsActive) {
+                await doc.ref.update({ 
+                    status: `Bypassed (GPS ${userData.gpsStatus})`, 
+                    totalToll: 0 
+                });
+                continue;
+            }
+
+            const batch = db.batch();
+            batch.update(db.collection("users").doc(trip.ownerId), {
+                walletBalance: admin.firestore.FieldValue.increment(-trip.totalToll)
+            });
+
+            const transRef = db.collection("transactions").doc();
+            batch.set(transRef, {
+                amount: trip.totalToll,
+                description: `Toll: ${trip.tollZoneName} (ANPR Backup)`,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                type: "debit",
+                userId: trip.ownerId,
+                plate: trip.plate
+            });
+
+            batch.update(doc.ref, { status: "completed" });
+            await batch.commit();
         }
     } catch (error) {
         console.error("❌ Processor Error:", error.message);
@@ -80,6 +115,7 @@ const processExitedVehicles = async () => {
 
 setInterval(processExitedVehicles, 60000);
 
+// 5. SERVER START
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`📡 Server listening on port ${PORT}`);
 });
