@@ -29,10 +29,11 @@ export const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
 
 // 2. MIDDLEWARE CONFIGURATION
 app.use(cors({
-  origin: ["https://toll-project-479605.web.app", "http://localhost:5173"],
+  origin: ["https://toll-project-479605.web.app", "http://localhost:5173","https://toll-project-479605.firebaseapp.com"],
   credentials: true
 }));
 app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // 3. ROUTES
 // Replace these with your actual route file imports
