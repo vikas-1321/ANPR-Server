@@ -28,19 +28,18 @@ export const FieldValue = admin.firestore.FieldValue;
 export const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
 
 // 2. MIDDLEWARE CONFIGURATION
-const cors = require('cors');
+// REMOVED: const cors = require('cors'); <--- This was the duplicate causing the crash
 
-// This allows all origins (e.g., your Firebase URL) to access your API
 app.use(cors({
   origin: '*', 
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // 3. ROUTES
-// Replace these with your actual route file imports
 import authRoutes from './routes/authRoutes.js';
 import anprRoutes from './routes/anprRoutes.js';
 import zoneRoutes from './routes/zoneRoutes.js';
@@ -55,9 +54,8 @@ app.get('/', (req, res) => {
 
 // 4. BACKGROUND PROCESSOR (Situations A, B, & C)
 const processExitedVehicles = async () => {
-    console.log("⏱️  Checking for vehicles that exited the zone...");
+    console.log("⏱️ Checking for vehicles that exited the zone...");
     try {
-        // Threshold: 10 minutes of inactivity = Exit
         const EXIT_THRESHOLD = new Date(Date.now() - 10 * 60 * 1000);
 
         const expiredTrips = await db.collection("vehicle_trips")
@@ -73,18 +71,15 @@ const processExitedVehicles = async () => {
         for (const doc of expiredTrips.docs) {
             const trip = doc.data();
             
-            // SITUATION C: Unregistered Vehicle (No ownerId)
             if (!trip.ownerId) {
                 await doc.ref.update({ status: "Invoice Pending" });
                 console.log(`📋 Unregistered: ${trip.plate} marked as Invoice Pending.`);
                 continue;
             }
 
-            // REGISTERED VEHICLES (A & B)
             const userDoc = await db.collection("users").doc(trip.ownerId).get();
             const userData = userDoc.data();
 
-            // SITUATION A: GPS is active/searching (Bypass)
             const isGpsActive = userData?.gpsStatus === 'Connected' || userData?.gpsStatus === 'Searching';
             if (isGpsActive) {
                 await doc.ref.update({ 
@@ -95,27 +90,23 @@ const processExitedVehicles = async () => {
                 continue;
             }
 
-            // SITUATION B: GPS Offline (Deduct Wallet)
             try {
                 const batch = db.batch();
                 
-                // Deduct balance
                 batch.update(db.collection("users").doc(trip.ownerId), {
-                    walletBalance: FieldValue.increment(-trip.totalToll)
+                    walletBalance: admin.firestore.FieldValue.increment(-trip.totalToll)
                 });
 
-                // Record Transaction
                 const transRef = db.collection("transactions").doc();
                 batch.set(transRef, {
                     amount: trip.totalToll,
                     description: `Toll: ${trip.tollZoneName} (ANPR Backup)`,
-                    timestamp: serverTimestamp(),
+                    timestamp: admin.firestore.FieldValue.serverTimestamp(),
                     type: "debit",
                     userId: trip.ownerId,
                     plate: trip.plate
                 });
 
-                // Complete Trip
                 batch.update(doc.ref, { status: "completed" });
                 
                 await batch.commit();
@@ -129,7 +120,6 @@ const processExitedVehicles = async () => {
     }
 };
 
-// Start the 60-second background timer
 setInterval(processExitedVehicles, 60000);
 
 // 5. SERVER START
